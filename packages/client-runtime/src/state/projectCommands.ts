@@ -13,12 +13,7 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { Atom, AtomRegistry } from "effect/reactivity";
 
-import {
-  type EnvironmentRpcInput,
-  type EnvironmentRpcSuccess,
-  request,
-  requestGuarded,
-} from "../rpc/client.ts";
+import { type EnvironmentRpcInput, request, requestGuarded } from "../rpc/client.ts";
 import type { EnvironmentProject } from "./models.ts";
 import {
   createAtomCommandScheduler,
@@ -60,8 +55,8 @@ function optimisticProjectFileKey(target: OptimisticProjectFileTarget): string {
 }
 
 function writtenFilePaths(
-  input: EnvironmentRpcInput<typeof WS_METHODS.projectsWriteFile>,
-  result: EnvironmentRpcSuccess<typeof WS_METHODS.projectsWriteFile>,
+  input: { readonly cwd: string; readonly relativePath: string },
+  result: { readonly relativePath: string },
 ) {
   return new Set(
     [result.relativePath, input.relativePath].map((path) =>
@@ -219,6 +214,27 @@ export function createProjectEnvironmentAtoms<R, E>(
       },
       execute: (input) =>
         requestGuarded(WS_METHODS.projectsWriteFile, input).pipe(
+          Effect.tap((result) =>
+            Effect.forEach(writtenFilePaths(input, result), fileMetadata.invalidate),
+          ),
+        ),
+      onSuccess: ({ environmentId, input }, registry, result) =>
+        Effect.sync(() => {
+          for (const path of writtenFilePaths(input, result))
+            fileMetadata.refreshPath(environmentId, path, registry);
+        }),
+    }),
+    createEntry: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:projects:create-entry",
+      tag: WS_METHODS.projectsCreateEntry,
+      scheduler: fileScheduler,
+      concurrency: {
+        mode: "serial",
+        key: ({ environmentId, input }) =>
+          JSON.stringify([environmentId, input.cwd, input.relativePath]),
+      },
+      execute: (input) =>
+        requestGuarded(WS_METHODS.projectsCreateEntry, input).pipe(
           Effect.tap((result) =>
             Effect.forEach(writtenFilePaths(input, result), fileMetadata.invalidate),
           ),

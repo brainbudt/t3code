@@ -4,6 +4,8 @@ import * as NodeFSP from "node:fs/promises";
 
 import type {
   FilesystemEntryMetadata,
+  ProjectCreateEntryInput,
+  ProjectCreateEntryResult,
   FilesystemGetMetadataInput,
   FilesystemGetMetadataResult,
   ProjectReadFileInput,
@@ -99,11 +101,25 @@ export class WorkspaceBinaryFileError extends Schema.TaggedError<WorkspaceBinary
   }
 }
 
+export class WorkspaceEntryExistsError extends Schema.TaggedError<WorkspaceEntryExistsError>()(
+  "WorkspaceEntryExistsError",
+  {
+    workspaceRoot: Schema.String,
+    relativePath: Schema.String,
+    resolvedPath: Schema.String,
+  },
+) {
+  override get message(): string {
+    return `Workspace entry '${this.relativePath}' in '${this.workspaceRoot}' already exists: ${this.resolvedPath}`;
+  }
+}
+
 export const WorkspaceFileSystemError = Schema.Union([
   WorkspaceFileSystemOperationError,
   WorkspaceFilePathEscapeError,
   WorkspacePathNotFileError,
   WorkspaceBinaryFileError,
+  WorkspaceEntryExistsError,
 ]);
 export type WorkspaceFileSystemError = typeof WorkspaceFileSystemError.Type;
 
@@ -125,6 +141,15 @@ export class WorkspaceFileSystem extends Context.Service<
       input: ProjectWriteFileInput,
     ) => Effect.Effect<
       ProjectWriteFileResult,
+      | WorkspaceFileSystemError
+      | WorkspacePaths.WorkspacePathOutsideRootError
+      | KnownWorkspaces.UnknownWorkspaceError
+    >;
+    /** Creates a new empty file or folder inside a known workspace. Never replaces an entry. */
+    readonly createEntry: (
+      input: ProjectCreateEntryInput,
+    ) => Effect.Effect<
+      ProjectCreateEntryResult,
       | WorkspaceFileSystemError
       | WorkspacePaths.WorkspacePathOutsideRootError
       | KnownWorkspaces.UnknownWorkspaceError
@@ -445,7 +470,7 @@ export const make = Effect.gen(function* () {
 
   // Resolve existing ancestors and reject dangling links so creation cannot follow symlinks outside root.
   const resolveWriteTarget = Effect.fn("WorkspaceFileSystem.resolveWriteTarget")(function* (
-    input: ProjectWriteFileInput,
+    input: Pick<ProjectWriteFileInput, "cwd" | "relativePath">,
   ) {
     const target = yield* workspacePaths.resolveRelativePathWithinRoot({
       workspaceRoot: input.cwd,
@@ -569,7 +594,65 @@ export const make = Effect.gen(function* () {
     return { relativePath: target.relativePath };
   });
 
-  return WorkspaceFileSystem.of({ getMetadata, readFile, writeFile });
+  const createEntry: WorkspaceFileSystem["Service"]["createEntry"] = Effect.fn(
+    "WorkspaceFileSystem.createEntry",
+  )(function* (input) {
+    yield* knownWorkspaces.assertContains(input.cwd);
+    const target = yield* resolveWriteTarget(input);
+    const realTargetPath = target.realTargetPath;
+    const operationError = (
+      operation: "make-directory" | "write-file",
+      operationPath: string,
+      cause: unknown,
+    ) =>
+      new WorkspaceFileSystemOperationError({
+        workspaceRoot: input.cwd,
+        relativePath: input.relativePath,
+        resolvedPath: realTargetPath,
+        operationPath,
+        operation,
+        cause,
+      });
+
+    // Missing parent folders are created, like writeFile; the entry itself must be new.
+    yield* fileSystem
+      .makeDirectory(path.dirname(realTargetPath), { recursive: true })
+      .pipe(
+        Effect.mapError((cause) =>
+          operationError("make-directory", path.dirname(realTargetPath), cause),
+        ),
+      );
+    yield* Effect.tryPromise({
+      // O_EXCL and a non-recursive mkdir fail on any existing entry, including a symlink.
+      try: async () => {
+        if (input.kind === "directory") {
+          await NodeFSP.mkdir(realTargetPath);
+          return;
+        }
+        const handle = await NodeFSP.open(
+          realTargetPath,
+          NodeFS.constants.O_WRONLY | NodeFS.constants.O_CREAT | NodeFS.constants.O_EXCL,
+        );
+        await handle.close();
+      },
+      catch: (cause) =>
+        (cause as NodeJS.ErrnoException).code === "EEXIST"
+          ? new WorkspaceEntryExistsError({
+              workspaceRoot: input.cwd,
+              relativePath: input.relativePath,
+              resolvedPath: realTargetPath,
+            })
+          : operationError(
+              input.kind === "directory" ? "make-directory" : "write-file",
+              realTargetPath,
+              cause,
+            ),
+    });
+    yield* workspaceEntries.refresh(input.cwd);
+    return { relativePath: target.relativePath };
+  });
+
+  return WorkspaceFileSystem.of({ getMetadata, readFile, writeFile, createEntry });
 });
 
 export const layer = Layer.effect(WorkspaceFileSystem, make);

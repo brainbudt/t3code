@@ -3,7 +3,11 @@ import type {
   ContextMenuItem as TreeContextMenuItem,
   ContextMenuOpenContext as TreeContextMenuOpenContext,
 } from "@pierre/trees";
-import type { EnvironmentId, ProjectEntry } from "@t3tools/contracts";
+import {
+  AuthFilesystemWriteScope,
+  type EnvironmentId,
+  type ProjectEntry,
+} from "@t3tools/contracts";
 import { FileTree, useFileTree, useFileTreeSearch, useFileTreeSelector } from "@pierre/trees/react";
 import { settlePromise } from "@t3tools/client-runtime/state/runtime";
 import { serializeComposerFileLink } from "@t3tools/shared/composerTrigger";
@@ -34,6 +38,10 @@ import { buildFileTreePathUpdates } from "./fileTreePathReconciliation";
 import { loadFileAncestors } from "./loadFileAncestors";
 import { useDirectoryEntries } from "./useDirectoryEntries";
 import { useProjectPathSearch } from "~/state/queries";
+import { useEnvironmentScope } from "~/state/session";
+
+import { CreateEntryDialog, type CreateEntryRequest } from "./CreateEntryDialog";
+import { createEntryParentPath } from "./fileTreeCreateEntry";
 
 interface FileBrowserPanelProps {
   environmentId: EnvironmentId;
@@ -51,6 +59,49 @@ interface FileBrowserPanelProps {
 
 function treePath(entry: ProjectEntry): string {
   return entry.kind === "directory" ? `${entry.path}/` : entry.path;
+}
+
+const CREATE_ENTRY_MENU_ITEMS = [
+  { id: "new-file", label: "New File…" },
+  { id: "new-folder", label: "New Folder…" },
+] as const;
+
+function createEntryKindForMenuId(id: string): ProjectEntry["kind"] | null {
+  return id === "new-file" ? "file" : id === "new-folder" ? "directory" : null;
+}
+
+/** Expands a folder's ancestors, then selects, scrolls to and focuses it. False until it is in the tree. */
+function revealTreeFolder(
+  model: ReturnType<typeof useFileTree>["model"],
+  container: HTMLElement | null,
+  path: string,
+): boolean {
+  if (!model.getItem(path)) return false;
+  for (const selectedPath of model.getSelectedPaths()) model.getItem(selectedPath)?.deselect();
+  const segments = path.replace(/\/$/, "").split("/");
+  let ancestorPath = "";
+  for (const segment of segments.slice(0, -1)) {
+    ancestorPath = ancestorPath ? `${ancestorPath}/${segment}` : segment;
+    const ancestor = model.getItem(`${ancestorPath}/`);
+    if (ancestor && "expand" in ancestor) ancestor.expand();
+  }
+  model.getItem(path)?.select();
+  model.scrollToPath(path, { focus: true, offset: "center" });
+  focusTreeRow(container, path);
+  return true;
+}
+
+/** The tree's own focus helpers only move its focus state when it already owns DOM focus. */
+function focusTreeRow(container: HTMLElement | null, treePath: string) {
+  for (const host of container?.querySelectorAll("*") ?? []) {
+    const row = host.shadowRoot?.querySelector<HTMLElement>(
+      `[data-item-path="${CSS.escape(treePath)}"]`,
+    );
+    if (row) {
+      row.focus();
+      return;
+    }
+  }
 }
 
 function RefreshFilesButton(props: { isPending: boolean; onRefresh: () => void }) {
@@ -148,6 +199,15 @@ export default function FileBrowserPanel({
   const { resolvedTheme } = useTheme();
   const composerRef = useComposerHandleContext();
   const fileContextMenu = useFileContextMenu(environmentId);
+  // Host folders sit outside the workspace, where the server does not create entries.
+  const canCreateEntries =
+    useEnvironmentScope(environmentId, AuthFilesystemWriteScope) && !hostFolder;
+  const [createRequest, setCreateRequest] = useState<CreateEntryRequest | null>(null);
+  // A created folder is revealed once the refreshed listing puts it in the tree.
+  const pendingRevealRef = useRef<string | null>(null);
+  // The row the create menu opened on, so closing the dialog returns focus to the tree.
+  const createAnchorPathRef = useRef<string | null>(null);
+  const treeContainerRef = useRef<HTMLDivElement>(null);
   const {
     entries: directoryEntries,
     load,
@@ -191,16 +251,35 @@ export default function FileBrowserPanel({
         : { x: anchorRect.left, y: anchorRect.bottom };
       const fileTarget = { environmentId, filePath: relativePath, workspaceRoot: cwd };
       const fileMenuItems = fileContextMenu.buildItems(fileTarget);
+      let createAfterClose: CreateEntryRequest | null = null;
       void settlePromise(async () => {
         const clicked = await api.contextMenu.show(
           [
             ...fileMenuItems,
             { id: "copy-mention", label: "Copy mention" },
             { id: "add-to-chat", label: "Add to chat" },
+            ...(canCreateEntries
+              ? CREATE_ENTRY_MENU_ITEMS.map((entry, index) => ({
+                  ...entry,
+                  separatorBefore: index === 0,
+                }))
+              : []),
           ],
           position,
         );
         if (clicked === null) return;
+        const createKind = createEntryKindForMenuId(clicked);
+        if (createKind !== null) {
+          createAfterClose = {
+            kind: createKind,
+            parentPath: createEntryParentPath(
+              relativePath,
+              entryKindsRef.current.get(relativePath),
+            ),
+          };
+          createAnchorPathRef.current = item.path;
+          return;
+        }
         // Open-with submenu ids are absent from the top-level item list.
         const isFileMenuAction =
           fileMenuItems.some((entry) => entry.id === clicked) || clicked.startsWith("editor:");
@@ -246,10 +325,26 @@ export default function FileBrowserPanel({
         }
       }).then((result) => {
         context.close();
+        // Open after the tree's menu closes so its focus restore cannot pull focus from the dialog.
+        if (createAfterClose !== null) setCreateRequest(createAfterClose);
         if (!AsyncResult.isSuccess(result)) throw Cause.squash(result.cause);
       });
     },
   );
+
+  // Right-clicking empty space below the rows creates at the workspace root; rows handle their own.
+  const showRootContextMenu = (event: React.MouseEvent) => {
+    if (event.defaultPrevented || !canCreateEntries) return;
+    const api = readLocalApi();
+    if (!api) return;
+    event.preventDefault();
+    void api.contextMenu
+      .show([...CREATE_ENTRY_MENU_ITEMS], { x: event.clientX, y: event.clientY })
+      .then((clicked) => {
+        const createKind = clicked === null ? null : createEntryKindForMenuId(clicked);
+        if (createKind !== null) setCreateRequest({ kind: createKind, parentPath: "" });
+      });
+  };
 
   const loadingDirectoriesRef = useRef(loadingDirectories);
   const dragMention = createFileTreeDragMentionController(
@@ -368,6 +463,22 @@ export default function FileBrowserPanel({
     }
     search.setValue(value);
   };
+  const handleEntryCreated = (relativePath: string, request: CreateEntryRequest) => {
+    // Focus goes to the new entry once the dialog has closed, not back to the row the menu opened on.
+    createAnchorPathRef.current = request.kind === "directory" ? `${relativePath}/` : relativePath;
+    // Folders list lazily: re-read the folder that was stale, then any new folders on the way.
+    void load(request.parentPath, true)
+      .then(() => loadFileAncestors(relativePath, load, { signal: new AbortController().signal }))
+      .then(() => {
+        if (request.kind === "file") {
+          onOpenFile(panelPath(relativePath));
+          return;
+        }
+        pendingRevealRef.current = `${relativePath}/`;
+        if (revealTreeFolder(model, treeContainerRef.current, pendingRevealRef.current))
+          pendingRevealRef.current = null;
+      });
+  };
   const handleRefresh = () => {
     refresh();
     if (query.trim()) pathSearch.refresh();
@@ -390,10 +501,17 @@ export default function FileBrowserPanel({
     previousTreePathsRef.current = treePaths;
     if (previousTreePaths === null) {
       model.resetPaths(treePaths);
-      return;
+    } else {
+      const updates = buildFileTreePathUpdates(previousTreePaths, treePaths);
+      if (updates.length > 0) model.batch(updates);
     }
-    const updates = buildFileTreePathUpdates(previousTreePaths, treePaths);
-    if (updates.length > 0) model.batch(updates);
+    const pendingReveal = pendingRevealRef.current;
+    if (
+      pendingReveal !== null &&
+      revealTreeFolder(model, treeContainerRef.current, pendingReveal)
+    ) {
+      pendingRevealRef.current = null;
+    }
   }, [ready, entryKinds, model, treePaths]);
 
   useEffect(() => {
@@ -548,13 +666,32 @@ export default function FileBrowserPanel({
           </div>
         ) : null
       ) : (
-        <FileTree
-          model={model}
-          aria-label={`${projectName} files`}
-          className="min-h-0 flex-1 overflow-hidden"
-          style={pierreTreeStyle(resolvedTheme)}
-        />
+        <div
+          ref={treeContainerRef}
+          className="flex min-h-0 flex-1 flex-col"
+          onContextMenu={showRootContextMenu}
+        >
+          <FileTree
+            model={model}
+            aria-label={`${projectName} files`}
+            className="min-h-0 flex-1 overflow-hidden"
+            style={pierreTreeStyle(resolvedTheme)}
+          />
+        </div>
       )}
+      <CreateEntryDialog
+        environmentId={environmentId}
+        cwd={cwd}
+        projectName={projectName}
+        request={createRequest}
+        onClose={() => setCreateRequest(null)}
+        onRestoreFocus={() => {
+          const anchorPath = createAnchorPathRef.current;
+          createAnchorPathRef.current = null;
+          if (anchorPath !== null) focusTreeRow(treeContainerRef.current, anchorPath);
+        }}
+        onCreated={handleEntryCreated}
+      />
     </div>
   );
 }
