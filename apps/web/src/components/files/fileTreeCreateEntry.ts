@@ -28,3 +28,17 @@ export function resolveNewEntryPath(
   const relative = segments.join("/");
   return { relativePath: parentPath ? `${parentPath}/${relative}` : relative };
 }
+
+/** Folders whose listings change when `relativePath` is created from `parentPath`, outermost first. */
+export function foldersToRefresh(parentPath: string, relativePath: string): string[] {
+  const below = relativePath
+    .slice(parentPath ? parentPath.length + 1 : 0)
+    .split("/")
+    .slice(0, -1);
+  return [
+    parentPath,
+    ...below.map((_, index) =>
+      [parentPath, ...below.slice(0, index + 1)].filter(Boolean).join("/"),
+    ),
+  ];
+}

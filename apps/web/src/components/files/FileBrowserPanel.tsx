@@ -41,7 +41,7 @@ import { useProjectPathSearch } from "~/state/queries";
 import { useEnvironmentScope } from "~/state/session";
 
 import { CreateEntryDialog, type CreateEntryRequest } from "./CreateEntryDialog";
-import { createEntryParentPath } from "./fileTreeCreateEntry";
+import { createEntryParentPath, foldersToRefresh } from "./fileTreeCreateEntry";
 
 interface FileBrowserPanelProps {
   environmentId: EnvironmentId;
@@ -466,9 +466,11 @@ export default function FileBrowserPanel({
   const handleEntryCreated = (relativePath: string, request: CreateEntryRequest) => {
     // Focus goes to the new entry once the dialog has closed, not back to the row the menu opened on.
     createAnchorPathRef.current = request.kind === "directory" ? `${relativePath}/` : relativePath;
-    // Folders list lazily: re-read the folder that was stale, then any new folders on the way.
-    void load(request.parentPath, true)
-      .then(() => loadFileAncestors(relativePath, load, { signal: new AbortController().signal }))
+    // A search filter would hide a new folder; files close it through the selection reveal.
+    if (request.kind === "directory") closeSearch();
+    // Folders list lazily and cache: re-read every folder from the chosen one down to the new entry.
+    void foldersToRefresh(request.parentPath, relativePath)
+      .reduce((previous, folder) => previous.then(() => load(folder, true)), Promise.resolve())
       .then(() => {
         if (request.kind === "file") {
           onOpenFile(panelPath(relativePath));

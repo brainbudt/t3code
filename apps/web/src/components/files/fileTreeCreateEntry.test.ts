@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { createEntryParentPath, resolveNewEntryPath } from "./fileTreeCreateEntry";
+import {
+  createEntryParentPath,
+  foldersToRefresh,
+  resolveNewEntryPath,
+} from "./fileTreeCreateEntry";
 
 describe("createEntryParentPath", () => {
   it("creates inside a folder, beside a file, and at the root for top-level files", () => {
@@ -31,5 +35,19 @@ describe("resolveNewEntryPath", () => {
     ]) {
       expect(resolveNewEntryPath("src", name)).toHaveProperty("error");
     }
+  });
+});
+
+describe("foldersToRefresh", () => {
+  it("re-reads every folder from the chosen one down to the new entry's folder", () => {
+    expect(foldersToRefresh("", "README.md")).toEqual([""]);
+    expect(foldersToRefresh("src", "src/notes.md")).toEqual(["src"]);
+    // `src` may already be loaded and cached when creating from the root.
+    expect(foldersToRefresh("", "src/assets")).toEqual(["", "src"]);
+    expect(foldersToRefresh("src", "src/components/ui/Card.tsx")).toEqual([
+      "src",
+      "src/components",
+      "src/components/ui",
+    ]);
   });
 });
