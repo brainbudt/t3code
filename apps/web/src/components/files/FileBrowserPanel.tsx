@@ -468,9 +468,11 @@ export default function FileBrowserPanel({
     createAnchorPathRef.current = request.kind === "directory" ? `${relativePath}/` : relativePath;
     // A search filter would hide a new folder; files close it through the selection reveal.
     if (request.kind === "directory") closeSearch();
-    // Folders list lazily and cache: re-read every folder from the chosen one down to the new entry.
+    // Folders list lazily and cache: re-read every folder from the chosen one down to the new entry,
+    // then load any ancestor a search result showed without ever listing it.
     void foldersToRefresh(request.parentPath, relativePath)
       .reduce((previous, folder) => previous.then(() => load(folder, true)), Promise.resolve())
+      .then(() => loadFileAncestors(relativePath, load, { signal: new AbortController().signal }))
       .then(() => {
         if (request.kind === "file") {
           onOpenFile(panelPath(relativePath));
