@@ -667,4 +667,140 @@ it.layer(layerTest, { excludeTestServices: true })("WorkspaceFileSystemLive", (i
       }),
     );
   });
+
+  describe("createEntry", () => {
+    it.effect("creates an empty file and a folder, with missing parents, and lists them", () =>
+      Effect.gen(function* () {
+        const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
+        const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const cwd = yield* makeTempDir;
+        yield* workspaceEntries.list({ cwd });
+
+        const file = yield* workspaceFileSystem.createEntry({
+          cwd,
+          relativePath: "src/notes/todo.md",
+          kind: "file",
+        });
+        const folder = yield* workspaceFileSystem.createEntry({
+          cwd,
+          relativePath: "assets",
+          kind: "directory",
+        });
+
+        expect(file.relativePath).toBe("src/notes/todo.md");
+        expect(folder.relativePath).toBe("assets");
+        expect(yield* fileSystem.readFileString(path.join(cwd, "src/notes/todo.md"))).toBe("");
+        expect((yield* fileSystem.stat(path.join(cwd, "assets"))).type).toBe("Directory");
+        const listed = yield* workspaceEntries.list({ cwd });
+        expect(listed.entries).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ path: "src/notes/todo.md", kind: "file" }),
+            expect.objectContaining({ path: "assets", kind: "directory" }),
+          ]),
+        );
+      }),
+    );
+
+    it.effect("never replaces an existing file or folder", () =>
+      Effect.gen(function* () {
+        const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const cwd = yield* makeTempDir;
+        yield* writeTextFile(cwd, "README.md", "keep me\n");
+        yield* writeTextFile(cwd, "src/index.ts", "export {};\n");
+
+        for (const [relativePath, kind] of [
+          ["README.md", "file"],
+          ["README.md", "directory"],
+          ["src", "file"],
+          ["src", "directory"],
+        ] as const) {
+          const error = yield* workspaceFileSystem
+            .createEntry({ cwd, relativePath, kind })
+            .pipe(Effect.flip);
+          expect(error).toBeInstanceOf(WorkspaceFileSystem.WorkspaceEntryExistsError);
+        }
+
+        expect(yield* fileSystem.readFileString(path.join(cwd, "README.md"))).toBe("keep me\n");
+        expect(yield* fileSystem.readDirectory(path.join(cwd, "src"))).toEqual(["index.ts"]);
+      }),
+    );
+
+    it.effect.skipIf(!symlinksSupported)(
+      "does not create through or over symlinks, even dangling ones",
+      () =>
+        Effect.gen(function* () {
+          const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const cwd = yield* makeTempDir;
+          const outsideDir = yield* makeTempDir;
+          yield* fileSystem.symlink(outsideDir, path.join(cwd, "linked-dir"));
+          yield* fileSystem.symlink(
+            path.join(outsideDir, "missing.md"),
+            path.join(cwd, "dangling.md"),
+          );
+
+          for (const kind of ["file", "directory"] as const) {
+            const escape = yield* workspaceFileSystem
+              .createEntry({ cwd, relativePath: "linked-dir/new", kind })
+              .pipe(Effect.flip);
+            expect(escape).toBeInstanceOf(WorkspaceFileSystem.WorkspaceFilePathEscapeError);
+            const dangling = yield* workspaceFileSystem
+              .createEntry({ cwd, relativePath: "dangling.md", kind })
+              .pipe(Effect.flip);
+            expect(dangling).toBeInstanceOf(WorkspaceFileSystem.WorkspaceFileSystemOperationError);
+          }
+
+          expect(yield* fileSystem.readDirectory(outsideDir)).toEqual([]);
+        }),
+    );
+
+    it.effect("refuses the workspace root, paths outside it, and git's folders", () =>
+      Effect.gen(function* () {
+        const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const cwd = yield* makeTempDir;
+        const outsideDir = yield* makeTempDir;
+        yield* writeTextFile(cwd, ".git/config", "[core]\n");
+
+        for (const relativePath of [".", "../escape", path.join(outsideDir, "abs")]) {
+          const error = yield* workspaceFileSystem
+            .createEntry({ cwd, relativePath, kind: "directory" })
+            .pipe(Effect.flip);
+          expect(error).toBeInstanceOf(WorkspacePaths.WorkspacePathOutsideRootError);
+        }
+        for (const relativePath of [".git/hooks/pre-commit", ".git/new-folder"]) {
+          const error = yield* workspaceFileSystem
+            .createEntry({ cwd, relativePath, kind: "file" })
+            .pipe(Effect.flip);
+          expect(error).toBeInstanceOf(WorkspaceFileSystem.WorkspaceFilePathEscapeError);
+        }
+
+        expect(yield* fileSystem.readDirectory(outsideDir)).toEqual([]);
+        expect(yield* fileSystem.readDirectory(path.join(cwd, ".git"))).toEqual(["config"]);
+      }),
+    );
+
+    it.effect("rejects creation outside a known workspace", () =>
+      Effect.gen(function* () {
+        const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const cwd = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: UNKNOWN_WORKSPACE_PREFIX,
+        });
+
+        const error = yield* workspaceFileSystem
+          .createEntry({ cwd, relativePath: "notes.md", kind: "file" })
+          .pipe(Effect.flip);
+
+        expect(error).toBeInstanceOf(KnownWorkspaces.UnknownWorkspaceError);
+        expect(yield* fileSystem.readDirectory(cwd)).toEqual([]);
+      }),
+    );
+  });
 });
